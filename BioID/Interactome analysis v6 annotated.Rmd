@@ -1,0 +1,1412 @@
+---
+title: "e-sarcoglycan interactome - BioID"
+author: "Laura Abram adapted from Frank Stein (PCF)"
+---
+  
+This analysis pipeline is partly based on an analysis workflow developed by Bernd Klaus.
+ 
+# R setup
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, autodep = TRUE)
+```
+ 
+#Define working directory - This directory should contain the metadata file and the tab delimited text files containing the data.
+```{r echo = FALSE}
+setwd("C:/Users/laura/OneDrive - Cardiff University/Documents/3 - PhD/Proteomics/Interactome/Annotated script GitHub")
+```
+
+## Loading packages
+```{r LoadingPackages}
+library(vsn)
+library(limma)
+library(MSnbase)
+library(gplots)
+library(fdrtool)
+library(biobroom)
+library(tidyverse)
+library(UpSetR)
+library(glue)
+library(rstatix)
+library(ggpubr)
+library(Biostrings)
+library(camprotR)
+library(httr)
+library(openxlsx)
+library(ggthemes)
+library(tidytext)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+```
+
+## Defining functions and parameters
+```{r DefiningFunctions}
+#create output folder 
+script.version <- "V6" 
+dir_save <- paste0("analysis/", Sys.Date())
+if (!dir.exists(dir_save))
+{dir.create(dir_save)}
+
+# set seed for reproducibility
+set.seed(1234)
+
+#define custom plots
+customPlot <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = 21), 
+  scale_fill_manual(values = c("#FFFFFF", "#D55E00", "#FFFFFF", "#0072B2")), 
+  scale_colour_manual(values = c("#D55E00", "#D55E00", "#0072B2", "#0072B2")))
+
+customPlot_DE <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = c(16, 17, 15, 3, 7, 8)), 
+  scale_colour_manual(values = c("enriched hit" = "#1f78b4", "enriched candidate" = "#a6cee3", "hit" = "#33a02c", "candidate" = "#b2df8a", "enriched no hit" = "#000000", "no hit" = "#555555")),
+  scale_alpha_manual(values = c("enriched hit" = 1, "enriched candidate" = 1, "hit" = 0.6, "candidate" = 0.6, "enriched no hit" = 1, "no hit" = 0.1)))
+```
+
+# Loading data and annotating experimental conditions
+```{r loadRawFiles}
+#.csv assigning sample information to LC-MS channels. This also specifies .tsv files within the directory to read
+conditions <- read.delim("metadata.csv", sep = ";")
+files <- file.path(unique(conditions$file))
+files <- files[file.exists(files)]
+
+#create a dataframe from the raw .tsv file and remove proteins that do not meet the filtering criteria below
+data <- NULL
+for (i in seq_along(files))
+{
+  print(files[i])
+  x <- read_delim(file.path(files[i]), delim = "	")
+  names(x) <- make.names(names(x))
+  x$Gene[is.na(x$Gene)] <- x$Protein.ID[is.na(x$Gene)]
+  x <- x %>%
+    dplyr::filter(Razor.Peptides >= 2) #keep only proteins with at least two razor peptide matches
+  x <- x %>%
+    dplyr::filter(Unique.Peptides >= 2) #keep only proteins with at least two unique peptide matches
+  x <- x %>%
+    dplyr::filter(!grepl("rev_", Protein)) #remove reverse hits
+  x <- x %>%
+    dplyr::filter(!grepl("contam_", Protein)) #remove known contaminants identified by EMBL
+  x$file <- files[i]
+  keepnames <- as.character(subset(conditions, file == files[i])$col.name)
+  x <- x[, c("Gene", "Protein.ID", "Protein.Description", "Organism", "Unique.Peptides", "Razor.Peptides", "Total.Intensity", "file", keepnames)]
+  x <- x %>%
+    group_by(Gene, Protein.ID, Protein.Description, Organism, Unique.Peptides, Razor.Peptides, Total.Intensity, file) %>%
+    gather(key = "col.name", value = "value", keepnames)
+  x$Total.Intensity <- as.numeric(as.character(x$Total.Intensity))
+  data <- bind_rows(data, x)
+  rm(x, keepnames)
+}
+rm(i, files)
+data <- left_join(data, conditions)
+data <- subset(data, value > 0)
+```
+#cRAP
+```{r cRAP}
+#further remove common contaminants highlighted in the Cambridge Centre For Proteomics camprotR dataset
+
+# download the CCP cRAP file and import in R
+outfile <- "CCP_cRAP.fasta"
+download_ccp_crap(file = outfile, is_crap = TRUE, overwrite = TRUE, verbose = TRUE)
+crap_ccp <- readAAStringSet(outfile)
+
+crap_ids <- str_match(names(crap_ccp), "^[^|]+\\|[^|]+\\|([^|]+)")[,2] #UniProt IDs of proteins in cRAP dataset 
+#remove anything in the cRAP dataset from our dataset
+data <- data %>%
+  filter(!Protein.ID %in% crap_ids)%>%
+  ungroup()
+
+# To identify proteins that have been removed:
+removed <- data %>%
+  filter(Protein.ID %in% crap_ids)
+
+#save dataset post quality control
+write.csv(data, file.path(dir_save, paste0("Data after quality control", script.version, "_", Sys.Date(), ".csv")),   row.names = FALSE)
+```
+
+#Identification overview
+```{r IdentificationOverview}
+#summarise and plot number of proteins identified in each sample 
+data %>%
+  ungroup() %>%
+  dplyr::select(Gene, condition, sample, rep) %>%
+  distinct() %>%
+  group_split(sample) %>%  # split data into a list by sample
+  purrr::walk(function(df_sample) {
+    sample_name <- unique(df_sample$sample)
+    p <- ggplot(df_sample, aes(condition, fill = rep)) +
+      geom_bar(position = position_dodge()) +
+      scale_fill_manual(values = c("#009E73", "#5DBB9F", "#B3E2CD"), labels = c("1", "2", "3")) +   # labels for biological replicates
+      scale_colour_manual(values = c("#009E73", "#5DBB9F", "#B3E2CD")) +
+      ggtitle(paste0("Protein identification overview - Sample: ", sample_name)) +
+      labs(caption = "proteins with at least 2 razor peptides and 2 unique peptides",
+        x = "Sample", y = "Protein Count",fill = "Replicate")+
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+      theme_classic()+
+      geom_text(aes(label = after_stat(count), y = after_stat(count)),
+        stat = "count", size = 2,
+        position = position_dodge(width = 0.9),
+        hjust = 1, angle = 90)
+    ggsave(filename = file.path(dir_save, paste0("Identification_CountOverview_", script.version, "_", Sys.Date(), ".png")), plot = p, width = 6, height = 4, dpi = 600)})
+
+#Upset plot to identify overlap of proteins identified across different samples
+upsetR.data <- data %>%
+  mutate(Gene = paste(Gene, Protein.ID, sep = "_")) %>%
+  group_by(Gene, ID) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(identified = 1) %>%
+  dplyr::select(Gene, ID, identified) %>%
+  spread(key = ID, value = identified, fill = 0) %>%
+  as.data.frame()
+colnames(upsetR.data) <- colnames(upsetR.data) %>%
+  str_replace("^.*?_", "")%>%
+  str_replace("_(?=[^_]*$)", ":")
+upset.plot <- upset(upsetR.data, order.by = "freq", nsets = 24, mb.ratio = c(0.4, 0.6), nintersects = 30)
+png(file = file.path(dir_save, paste0("Identification_UpSet_plot_", script.version,"_", Sys.Date(), ".png")), width = 2000, height = 2000, res=600)
+print(upset.plot)
+dev.off()
+rm(upset.plot)
+```
+
+# Identification and removal of duplicated gene names
+
+```{r renameDuplicates}
+dup.data <- data %>%
+  ungroup() %>%
+  dplyr::select(Gene, Protein.ID, file, Razor.Peptides) %>%
+  distinct() %>%
+  group_by(file, Gene) %>%
+  dplyr::filter(n() > 1) # identify duplicates
+if (nrow(dup.data) > 0) #save file if any duplicates are identified
+{write.csv(dup.data, file.path(dir_save, paste0("Duplicates_", script.version, ".csv")), row.names = FALSE)}
+dups <- unique(dup.data$Gene)
+if (length(dups) > 0)
+{
+  print("Duplicates were identified:")
+  print(dups)
+  print("Removing genes with smaller numbers of quantified peptides.")
+  for (dup in dups)
+  {
+    for (filen in unique(subset(dup.data, Gene == dup)$file))
+    {
+      sub <- subset(data, Gene == dup & file == filen)
+      data <- subset(data, paste(Gene, file) != paste(dup, filen))
+      sub <- subset(sub, Razor.Peptides == max(sub$Razor.Peptides, na.rm = TRUE))
+      data <- bind_rows(data, sub)
+      rm(sub)
+    }
+    rm(filen)
+  }
+  rm(dup)
+}
+dup.data <- data %>%
+  ungroup() %>%
+  dplyr::select(Gene, Protein.ID, file, Razor.Peptides) %>%
+  distinct() %>%
+  group_by(file, Gene) %>%
+  dplyr::filter(n() > 1)
+dups <- unique(dup.data$Gene)
+if (length(dups) > 0)
+{
+  print("Duplicates:")
+  print(dups)
+  print("Removing genes with the least overlap of protein ids in other ms experiments")
+  for (dup in dups)
+  {
+    sub <- subset(data, Gene %in% dup)
+    IDs <- unlist(strsplit(sub$Protein.ID, split = "[|]"))
+    rm(sub)
+    for (filen in unique(subset(dup.data, Gene == dup)$file))
+    {
+      sub <- subset(data, Gene == dup & file == filen)
+      data <- subset(data, paste(Gene, file) != paste(dup, filen))
+      sub$ID.count <- 0
+      for (ID in unique(sub$Protein.ID))
+      {
+        sub$ID.count[sub$Protein.ID == ID] <- length(which(IDs %in% unlist(strsplit(ID, split = "[|]"))))
+      }
+      sub <- subset(sub, ID.count == max(sub$ID.count, na.rm = TRUE))
+      sub$ID.count <- NULL
+      data <- bind_rows(data, sub)
+      rm(sub)
+    }
+    rm(filen, IDs)
+  }
+  rm(dup)
+}
+rm(dups, dup.data)
+```
+
+# Transforming long data to wide data
+
+```{r transformLongData2WideData, fig.height = 5}
+#plot of log-transformed reporter ion intensity, as TMT was used for this LC-MS experiment
+ggplot(data = data, aes(condition, log2(value), fill = rep)) + 
+  geom_boxplot() + 
+  ylab("log2(reporter_intensity)") + 
+  facet_grid(. ~ sample, scale = "free_x", space = "free") + 
+  customPlot + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+#build reporter ion intensity matrix
+##create a column for each channel and summarise reporter ion intensity per gene
+cdata <- data %>% #combined data = reporter ion intensities and metadata
+  group_by(Gene) %>%
+  mutate(key = paste("reporter_intensity", sample, condition, rep, sep = "_")) %>% 
+  dplyr::select(Gene, key, value) %>%
+  group_by(Gene, key) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  spread(key = key, value = value) #make matrix of reporter ion intensity for each gene
+
+#found.in.files -> number of raw files each protein appeared in - for this pipeline only 1 file
+fdata <- data %>% #feature data summarising one row per gene
+  group_by(Gene) %>%
+  dplyr::select(Gene, file) %>%
+  distinct() %>%
+  summarise(found.in.files = n())
+fdata_i <- data %>%
+  mutate(file2 = make.names(file)) %>%
+  group_by(Gene, file2) %>%
+  dplyr::select(Gene, file, file2) %>%
+  distinct() %>%
+  summarise(found.in.file = n()) %>%
+  mutate(file2 = paste0("found.in.file_", file2)) %>%
+  spread(key = file2, value = found.in.file)
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, file, sample) %>%
+  distinct() %>%
+  summarise(found.in.files = n()) %>%
+  mutate(sample = paste0("found.in.files_", sample)) %>%
+  spread(key = sample, value = found.in.files)
+fdata <- left_join(fdata, fdata_i)
+
+#found.in.conditions -> how many of the samples this protein appeared in 
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, condition) %>%
+  distinct() %>%
+  summarise(found.in.conditions = n())
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, condition, sample) %>%
+  distinct() %>%
+  summarise(found.in.conditions = n()) %>%
+  mutate(sample = paste0("found.in.conditions_", sample)) %>%
+  spread(key = sample, value = found.in.conditions)
+fdata <- left_join(fdata, fdata_i)
+
+#found.in.reps -> how many of the biological replicates this protein appeared in 
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, rep) %>%
+  distinct() %>%
+  summarise(found.in.reps = n())
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, rep, sample) %>%
+  distinct() %>%
+  summarise(found.in.reps = n()) %>%
+  mutate(sample = paste0("found.in.reps_", sample)) %>%
+  spread(key = sample, value = found.in.reps)
+fdata <- left_join(fdata, fdata_i)
+
+#Unique.Peptides overview -> calculate maximum number of unique peptides per protein
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, Unique.Peptides) %>%
+  distinct() %>%
+  summarise(max.Unique.Peptides = max(Unique.Peptides, na.rm = TRUE))
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, sample, Unique.Peptides) %>%
+  distinct() %>%
+  summarise(max.Unique.Peptides = max(Unique.Peptides, na.rm = TRUE)) %>%
+  mutate(sample = paste0("max.Unique.Peptides_", sample)) %>%
+  spread(key = sample, value = max.Unique.Peptides)
+fdata <- left_join(fdata, fdata_i)
+
+#Razor.Peptides overview -> calculate maximum number of razor peptides per protein
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, Razor.Peptides) %>%
+  distinct() %>%
+  summarise(max.Razor.Peptides = max(Razor.Peptides, na.rm = TRUE))
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, sample, Razor.Peptides) %>%
+  distinct() %>%
+  summarise(max.Razor.Peptides = max(Razor.Peptides, na.rm = TRUE)) %>%
+  mutate(sample = paste0("max.Razor.Peptides_", sample)) %>%
+  spread(key = sample, value = max.Razor.Peptides)
+fdata <- left_join(fdata, fdata_i)
+
+#abundance overview -> mean total reporter ion intensity across all samples for normalisation later in pipeline
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, Total.Intensity) %>%
+  distinct() %>%
+  summarise(average.Total.Intensity = mean(Total.Intensity, na.rm = TRUE))
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, sample, Total.Intensity) %>%
+  distinct() %>%
+  summarise(average.Total.Intensity = mean(Total.Intensity, na.rm = TRUE)) %>%
+  mutate(sample = paste0("average.Total.Intensity_", sample)) %>%
+  spread(key = sample, value = average.Total.Intensity)
+fdata <- left_join(fdata, fdata_i)
+id_data <- data %>%
+  ungroup() %>%
+  dplyr::select(Gene, Protein.ID, Protein.Description, Organism) %>%
+  distinct()
+dups <- id_data %>%
+  group_by(Gene) %>%
+  summarize(n = n()) %>%
+  dplyr::filter(n > 1) %>%
+  dplyr::select(Gene)
+if (nrow(dups) > 0) #merging duplicated proteins
+{
+  dups <- dups$Gene
+  dup.data <- subset(id_data, Gene %in% dups)
+  id_data <- subset(id_data, !Gene %in% dups)
+  combine_ids <- function(ids)
+  {
+    ids <- as.character(ids)
+    return(paste(
+      sort(unique(unlist(strsplit(ids, split = "[;]")))), collapse = ";"))
+  }
+  dup.data <- dup.data %>%
+    group_by(Gene) %>%
+    summarise(Protein.ID = combine_ids(Protein.ID), 
+              Protein.Description = combine_ids(Protein.Description), 
+              Organism = combine_ids(Organism))
+  id_data <- bind_rows(id_data, dup.data)
+  rm(dup.data, combine_ids)
+}
+rm(dups)
+fdata <- left_join(id_data, fdata)
+rm(id_data)
+cdata <- left_join(fdata, cdata)
+rm(fdata_i, fdata)
+```
+
+# Filter data
+```{r filterData}
+dim(cdata)
+#proteins for further analysis must have at least 2 unique and 2 razor peptides for confident calling.
+min.found.in.files <- 1 
+min.Razor.Peptides <- 2 
+min.Unique.Peptides <- 2
+for (s in unique(conditions$sample))
+{
+  cname <- paste0("keep_", s)
+  cdata[, cname] <- ifelse(
+    cdata[, paste0("found.in.files_", s)] >= 
+      min.found.in.files & cdata[, paste0("max.Razor.Peptides_", s)] >= min.Razor.Peptides, TRUE, FALSE)
+  cdata[is.na(cdata[, cname]), cname] <- FALSE
+  rm(cname)
+}
+rm(s)
+cdata$keep <- FALSE
+for (s in unique(conditions$sample))
+{
+  cname <- paste0("keep_", s)
+  cdata[, cname] <- ifelse(
+    cdata[, paste0("found.in.files_", s)] >= 
+      min.found.in.files & cdata[, paste0("max.Unique.Peptides_", s)] >= min.Unique.Peptides, TRUE, FALSE)
+  cdata[is.na(cdata[, cname]), cname] <- FALSE
+  rm(cname)
+}
+
+for (i in seq_along(rownames(cdata)))
+{cdata$keep[i] <- any(as.logical(cdata[i, grep("keep_", names(cdata), value = TRUE)]))}
+
+rm(i)
+cdata <- subset(cdata, keep)
+dim(cdata)
+rm(min.found.in.files, min.Razor.Peptides)
+```
+
+# Building an expression set object
+
+```{r buildingEset}
+#build an expression set object for analysis in Bioconductor package to hold numeric data (protein intensities), fdata (information about each protein) and pData (information about each sample)
+
+# Constructing assay data
+raw_data <- cdata %>%
+  dplyr::select(starts_with("reporter_intensity")) %>%
+  as.data.frame()
+rownames(raw_data) <- cdata$Gene
+names(raw_data) <- gsub("reporter_intensity_", "", names(raw_data))
+
+# Constructing metadata
+conditions_i <- data.frame(ID = names(raw_data))
+conditions_i <- left_join(conditions_i, conditions)
+
+# Constructing fdata
+fdata <- cdata %>%
+  dplyr::select(-starts_with("reporter_intensity")) %>%
+  as.data.frame()
+
+# Defining ID columns
+rownames(fdata) <- fdata$Gene
+rownames(conditions_i) <- conditions_i$ID
+colnames(raw_data) <- conditions_i$ID
+
+# Log2-transformation of raw_reporter_intensity values
+raw_data_m <- log2(as.matrix(raw_data))
+raw_data_m[is.infinite((raw_data_m))] <- NA
+raw_data_m[is.na((raw_data_m))] <- NA
+
+# Creating an expression set
+raw_dataE <- ExpressionSet(assayData = raw_data_m, #log transformed raw ion reporter intenities for each sample and gene
+                           phenoData = AnnotatedDataFrame(conditions_i), #information about each sample from metadata.csv
+                           featureData = AnnotatedDataFrame(fdata)) #information about each protein from .tsv
+validObject(raw_dataE)
+rm(raw_data, raw_data_m, conditions_i, fdata)
+```
+
+# Batch effect removal
+
+```{r removingBatchEffects}
+batchcl_dataE <- raw_dataE
+for (s in unique(conditions$sample)) # Loop over each unique sample.
+{
+  # Subset data for current sample and exclude missing values.
+  batchcl_dataE_i <- 
+    batchcl_dataE[fData(batchcl_dataE)[, paste0("keep_", s)], 
+                      batchcl_dataE$sample == s]
+
+  # Extract non-missing expression values.
+  exprs_available <- exprs(batchcl_dataE_i)
+  # Identify rows where all values are non-missing.
+  non_missing_indices <- complete.cases(exprs_available)
+
+  # Apply batch effect removal only to the non-missing values.
+  exprs(batchcl_dataE_i)[non_missing_indices, ] <- 
+    removeBatchEffect(exprs_available[non_missing_indices, ], 
+      batch = as.character(pData(batchcl_dataE_i)$rep), 
+      design = model.matrix(~0 + as.character(pData(batchcl_dataE_i)$condition))) #removes variation due to replicate/batch while preserving biological groups.
+  
+  for (cn in colnames(batchcl_dataE_i)) # Write batch-effect cleaned values back into main data
+  {
+    exprs(batchcl_dataE)[fData(batchcl_dataE)[, paste0("keep_", s)], cn] <- 
+      exprs(batchcl_dataE_i)[, cn]
+  }
+  rm(cn)
+}
+rm(s)
+```
+
+# Data normalization
+The vsn package from Wolfgang Huber is used to apply a variance stabilization normalization method on the log2 raw data.
+
+```{r DataNormalization}
+norm_dataE <- batchcl_dataE #using batch-corrected expression set 
+for (s in unique(conditions$sample)) #loop by sample
+{
+  for (ng in unique(conditions$norm_group[conditions$sample == s])) #loop by normalisation group
+  {
+    print(paste0(s, ": ", ng))
+    norm_input.data_i <- 2^exprs(norm_dataE[ #convert back to linear scale
+      fData(norm_dataE)[, paste0("keep_", s)], 
+      norm_dataE$norm_group == ng & 
+        norm_dataE$sample == s])
+    norm_dataE_i <- normalizeVSN(norm_input.data_i) #run variance stabilisation normalisation
+    for (cn in colnames(norm_dataE_i))
+    {
+      exprs(norm_dataE)[
+        fData(norm_dataE)[, paste0("keep_", s)], cn] <- #write back to expression set
+        norm_dataE_i[, cn]
+    }
+    rm(cn, norm_dataE_i)
+    sdplot.object <- meanSdPlot(vsn2(norm_input.data_i), plot = FALSE) #plot mean vs stdev: should be independent of each other
+    print(sdplot.object$gg + ggtitle(paste(s, ng)))
+    rm(sdplot.object, norm_input.data_i)
+  }
+  rm(ng)
+}
+rm(s)
+```
+
+# Calculation of ctrl-fold-changes
+To compare patient-control cell lines
+```{r CalculateCtrlFoldChanges}
+fc.data <- as.data.frame(2^exprs(norm_dataE)) #convert normalised data back to linear scale
+names.orig <- names(fc.data)
+for (i in seq_along(conditions$ID)) #loop through conditions from metadata
+{
+  fc.data[, paste0(conditions$ID[i], ".ctrl.ratio")] <-
+    fc.data[, as.character(conditions$ID[i])] /
+    apply(fc.data[, grep(paste0("^", conditions$sample[i], "_", conditions$ctrl[i], "_rep"), names.orig, value = TRUE)], 1, median, na.rm = TRUE) #uses ctrl variable from metadata assigning which controls are relevant to which samples
+
+}
+rm(i)
+fc.data <- fc.data %>%
+  dplyr::select(ends_with(".ctrl.ratio"))
+fc.data$Gene <- rownames(fc.data)
+ctrl.ratio_dataE <- norm_dataE #new expression set object for log2(ctrl-ratios)
+names(fc.data) <- gsub(".ctrl.ratio", "", names(fc.data))
+fc.data <- fc.data[ , colnames(ctrl.ratio_dataE)]
+exprs(ctrl.ratio_dataE) <- fc.data %>%
+  as.matrix() %>%
+  log2()
+
+rm(fc.data)
+```
+
+# PCA - principal component analysis
+```{r CreatePCAplots, fig.height = 5}
+sets <- list("Raw data" = raw_dataE, "Batch corrected data" = batchcl_dataE, "Normalised data" = norm_dataE) #uses 3 stages in data analysis pipeline for plotting
+
+#calculating pricipal components
+PCA_data <- NULL
+for (i in seq_along(sets)) {
+  set <- sets[[i]]
+  set.name <- names(sets)[i]
+  for (s in unique(conditions$sample)) {
+    set_s <- set[, set$sample == s]
+    PCA_m <- t(na.omit(exprs(set_s)))
+    if (length(PCA_m) > 50) {
+      PCA <- prcomp(PCA_m, scale = FALSE)
+      perc_var <- #calculate variance as a percentage
+        round(100 * PCA$sdev ^ 2 /
+                sum(PCA$sdev ^ 2), 1)
+      PCA_data_i <-
+        data.frame(PC1 = PCA$x[, 1], #calculate 3 PCs but only plot 2
+                   PC2 = PCA$x[, 2],
+                   PC3 = PCA$x[, 3],
+                   PC1.var = perc_var[1],
+                   PC2.var = perc_var[2],
+                   sample = pData(set_s)$sample,
+                   condition = pData(set_s)$condition,
+                   rep = pData(set_s)$rep,
+                   measurement = set.name)
+      PCA_data <- bind_rows(PCA_data, PCA_data_i)
+      rm(PCA_data_i)
+    }
+  }
+  rm(s)
+}
+rm(i)
+
+#plotting
+PCA_data$measurement <- factor(PCA_data$measurement, ordered = TRUE, levels = c("Raw data", "Batch corrected data", "Normalised data"))
+PCA_data <- PCA_data %>% # Create new columns for outline and fill
+  mutate(fraction = sub("_.*", "", condition), 
+    genotype = if_else(str_ends(condition, "C"), "WT", "PT"))
+
+p <- ggplot(PCA_data, aes(PC1, PC2)) +
+  geom_point(aes(fill = condition, colour = condition), shape = 21, size = 3, stroke = 1.2) +
+  scale_fill_manual(values = c(
+    "extracellular" = "#FFFFFF", 
+    "extracellular_C" = "#D55E00",
+    "intracellular_C" = "#0072B2",
+    "negcontrol" = "#FFFFFF", 
+    "negcontrol_C"="#009E73"
+  )) +
+  scale_colour_manual(values = c(
+    "extracellular" = "#D55E00", 
+    "extracellular_C" = "#D55E00",
+    "intracellular_C" = "#0072B2",
+    "negcontrol" = "#009E73", 
+    "negcontrol_C"="#009E73"
+  )) +
+  theme_minimal()+
+  ggtitle(paste0("Principal Component Analysis")) +
+  xlab("PC1") +
+  ylab("PC2") +
+  facet_wrap(~ measurement + paste("PC1:", PC1.var, "% var - PC2:", PC2.var, "% var"), scales = "free", ncol = 4)
+  
+ggsave(filename = file.path(dir_save, paste0("PCA_", script.version, "_",  Sys.Date(), ".png")),
+    plot = p, width = 11, height = 4, dpi = 600)
+write.csv(PCA_data, file = file.path(dir_save, paste0("PCA_data_", script.version, "_",  Sys.Date(), ".csv")), row.names = FALSE)
+```
+
+# Merge modified data back into 'cdata'
+
+```{r CreateCastedData}
+cdata_i <- as.data.frame(2^exprs(batchcl_dataE))
+names(cdata_i) <- paste0("batchcl_reporter_intensity_", names(cdata_i))
+cdata_i$Gene <- rownames(cdata_i)
+cdata <- left_join(cdata, cdata_i)
+rm(cdata_i)
+
+cdata_i <- as.data.frame(2^exprs(norm_dataE))
+names(cdata_i) <- paste0("norm_reporter_intensity_", names(cdata_i))
+cdata_i$Gene <- rownames(cdata_i)
+cdata <- left_join(cdata, cdata_i)
+rm(cdata_i)
+
+cdata_i <- as.data.frame(2^exprs(ctrl.ratio_dataE))
+names(cdata_i) <- paste0("ctrl.ratio_", names(cdata_i))
+cdata_i$Gene <- rownames(cdata_i)
+cdata <- left_join(cdata, cdata_i)
+rm(cdata_i)
+
+write.csv(cdata, file = file.path(dir_save, paste0("Full_dataset_", script.version, ".csv")), row.names = FALSE) #save all versions of full dataet across transformations
+```
+
+# Create tidy data
+
+```{r CreateTidyData}
+mdata <- NULL
+
+mdata_i <- tidy(raw_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "raw_reporter_intensity"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata_i <- tidy(batchcl_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "batchcl_reporter_intensity"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata_i <- tidy(norm_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "norm_reporter_intensity"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata_i <- tidy(ctrl.ratio_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "ctrl.ratio"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata$condition <- factor(mdata$condition, ordered = TRUE, levels = c("negcontrol_C", "intracellular_C", "extracellular_C", "negcontrol", "extracellular"))
+mdata$measurement <- factor(mdata$measurement, ordered = TRUE, levels = c("raw_reporter_intensity", "batchcl_reporter_intensity", "norm_reporter_intensity", "ctrl.ratio"))
+```
+
+# Data transformation overview
+
+```{r DataTransformationOverview, fig.height = 6}
+customPlot2 <- list(
+  theme_minimal(), 
+  scale_shape_manual(values = 21), 
+  scale_fill_manual(values = c("extracellular" = "#FFFFFF", "extracellular_C" = "#D55E00","intracellular_C" = "#0072B2",
+                               "negcontrol" = "#FFFFFF", "negcontrol_C"="#009E73")), 
+  scale_colour_manual(values = c("extracellular" = "#D55E00", "extracellular_C" = "#D55E00","intracellular_C" = "#0072B2",
+                                 "negcontrol" = "#009E73", "negcontrol_C"="#009E73")))
+
+mdata$condition <- factor(mdata$condition, ordered = TRUE, levels = c("extracellular", "extracellular_C", "intracellular_C", "negcontrol", "negcontrol_C"))
+
+new_labels <- c(
+  raw_reporter_intensity = "Raw data",
+  batchcl_reporter_intensity = "Batch corrected data",
+  norm_reporter_intensity = "Normalised data")
+
+#plot control-ratio data separately
+data_no_ratio <- mdata %>% filter(!grepl("ratio", measurement))
+  
+p1 <- ggplot(data_no_ratio, aes(x=condition, y=log2(value), group = interaction(condition, rep))) +
+    geom_boxplot(aes(fill = condition, colour=condition)) +
+  stat_summary(
+    data = subset(data_no_ratio, condition %in% c("extracellular_C", "intracellular_C", "negcontrol_C")),
+    fun = median, geom = "crossbar", width = 0.7, colour = "white", fatten = 2, position = position_dodge(width = 0.75),
+    aes(group = interaction(condition, rep))) +
+    customPlot2 +
+    theme(axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.line.x = element_blank()) +
+    ggtitle("Data Transformation Overview") +
+    theme_minimal()+
+    facet_grid(. ~ measurement, labeller = labeller(measurement = new_labels)) +
+  ylab("Log2(Reporter intensity)")
+  
+try({
+    ggsave(file.path(dir_save, paste0("Normalization_overview_", script.version, "_", Sys.Date(), ".png")), plot = p1, width = 10, height = 4, dpi = 150)}, silent = TRUE)
+  while (!is.null(dev.list())) dev.off()
+  
+try({
+    write.csv(data_no_ratio, file.path(dir_save, paste0("Normalization_overview_data_", script.version, "_", Sys.Date(), ".csv")),
+              row.names = FALSE)}, silent = TRUE)
+  
+data_ratio <- mdata %>% filter(grepl("ratio", measurement))
+  p2 <- ggplot(data_ratio, aes(x=condition, y=log2(value), group = interaction(condition, rep))) +
+    geom_boxplot(aes(fill = condition, colour=condition)) +
+    customPlot2 +
+    ggtitle("Data Transformation Overview (ratios)") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme_minimal()+
+    facet_grid(. ~ measurement, scales = "free")
+try({
+    ggsave(file.path(dir_save, paste0("Normalization_overview_ratios_", script.version, "_", Sys.Date(), ".png")),
+           plot = p2, width = 7, height = 4, dpi = 150)}, silent = TRUE)
+  while (!is.null(dev.list())) dev.off()
+  
+  try({
+    write.csv(data_ratio, file.path(dir_save, paste0("Normalization_overview_ratios_data_", script.version, "_", Sys.Date(), ".csv")),
+              row.names = FALSE)}, silent = TRUE)
+  
+rm(p1, p2, data_no_ratio, data_ratio)
+gc()
+```
+
+# CV overview (coefficient of variation)
+```{r CVOverview, fig.height = 6}
+cv.data <- mdata %>%
+  group_by(Gene, measurement, sample, condition) %>%
+  summarise(CV = sd(value, na.rm = TRUE) / mean(value, na.rm = TRUE)) #calculate CV for each condition
+cv.data.all <- mdata %>%
+  mutate(condition = "all") %>%
+  group_by(Gene, measurement, sample, condition) %>%
+  summarise(CV = sd(value, na.rm = TRUE) / mean(value, na.rm = TRUE)) #calculate CV across whole dataset
+cv.data <- bind_rows(cv.data, cv.data.all)
+rm(cv.data.all)
+ggplot(data = cv.data, aes(condition, CV * 100)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  customPlot +
+  ggtitle("CV overview") +
+  ylab("CV [%]") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  facet_grid(sample ~ measurement)
+ggsave(file.path(dir_save, paste0("CV_overview_", script.version, ".png")), width = 12, height = 10)
+```
+
+# LIMMA analysis
+A protein is considered a 'hit', if the false discovery rate is smaller 0.05 and an absolute log2 fold-change of at least log2(1.5) is observed.
+
+```{r Limma}
+limma_results <- NULL
+for (s in unique(conditions$sample)) #grouped by sample if you have multiple experiments 
+{limma_data <- norm_dataE[ #subset expression set
+    fData(norm_dataE)[, paste0("keep_", s)], 
+    norm_dataE$sample == s]
+  limma_weights <- #get raw intensities 
+    exprs(raw_dataE[fData(raw_dataE)[, paste0("keep_", s)], 
+                    raw_dataE$sample == s])
+  comparison.list <- c("negcontrol - negcontrol_C", "intracellular_C - negcontrol_C", "extracellular_C - negcontrol_C", "extracellular - negcontrol", "extracellular - extracellular_C", "(extracellular - negcontrol) - (extracellular_C - negcontrol_C)") #define comparisons to test
+  limma_weights <- ifelse(is.na(limma_weights), 0.01, 1) #weight = 0.01 for missing raw intensities to reduce influence of missing values
+  limma.cond <- factor(pData(limma_data)$condition, ordered = FALSE) #get conditions and replicates as factors for the design matrix
+  limma.rep <- factor(pData(limma_data)$rep, ordered = FALSE)
+  design.matrix <- model.matrix( ~  0 + limma.cond + limma.rep) #create design matrix: limma.rep controls for within-sample technical variation
+  colnames(design.matrix) <- gsub("limma.cond", "", colnames(design.matrix))
+  
+  limma.object <- eBayes( #fit the limma model for the defined comparisons with Empirical Bayes shirnkage
+    contrasts.fit(
+      lmFit(limma_data, design = design.matrix, weights = limma_weights), #lmFit: fits linear regression per protein
+      makeContrasts(contrasts = comparison.list, levels = design.matrix) #6 contrast matrices for the 6 defined comparisons
+    )
+  )
+  for (comparison in comparison.list)
+  {
+    limma_results_i <- limma::topTable(limma.object, 
+                           sort.by = "t",  
+                           coef = comparison, 
+                           number = Inf)
+    names(limma_results_i)[grep("P.Value", names(limma_results_i))] <- "pvalue.limma"
+    names(limma_results_i)[grep("adj.P.Val", names(limma_results_i))] <- "fdr.limma"
+    limma_results_i <- subset(limma_results_i, !is.na(logFC))
+    fdr_res <- NULL #also calculate using fdrtool to independently calculate FDR and p-value
+    try(fdr_res <- fdrtool(limma_results_i$t, plot = FALSE, verbose = FALSE))
+    if (!is.null(fdr_res))
+    {
+      limma_results_i$pvalue.fdrtool <- fdr_res$pval
+      limma_results_i$qval.fdrtool <- fdr_res$qval
+      limma_results_i$lfdr.fdrtool <- fdr_res$lfdr
+    }else
+    {
+      limma_results_i$pvalue.fdrtool <- 1
+      limma_results_i$qval.fdrtool <- 1
+      limma_results_i$lfdr.fdrtool <- 1
+    }
+    comparison.label <- gsub("\\) - \\(", ") against (", comparison)
+    comparison.label <- gsub(" - ", " vs ", comparison.label)
+    limma_results_i$comparison <- comparison
+    limma_results_i$comparison.label <- comparison.label
+    limma_results_i$sample <- s
+    limma_results <- bind_rows(limma_results, limma_results_i)
+    rm(limma_results_i, fdr_res)
+  }
+  rm(comparison.list, comparison, design.matrix, limma.cond, limma.rep, limma_data, limma_weights, limma.object)
+}
+rm(s)
+```
+
+
+## Hit annotation
+Enriched hits are defined as hits within the defined list of relevant comparisons e.g. extracellular compared to extracellular_negcontrol to identify hits that are a result of BioID expression
+```{r LimmaHitAnnotation}
+limma_results$hit_annotation_method <- NA
+fdr_hit_threshold <- 0.05 #define thresholds for "hit" proteins
+fc_hit_threshold <- 1.5
+limma_results$pvalue <- NA
+limma_results$fdr <- NA
+limma_results$comparison.old <- limma_results$comparison
+limma_results$comparison <- with(limma_results, paste0(sample, ": ", comparison))
+for (comparison in unique(limma_results$comparison))
+{
+  limma_hits <- 
+    nrow(limma_results[limma_results$comparison == comparison & 
+                         limma_results$fdr.limma <= fdr_hit_threshold, ])
+  fdrtool_hits <- 
+    nrow(limma_results[limma_results$comparison == comparison & 
+                         limma_results$qval.fdrtool <= fdr_hit_threshold, ])
+  if (limma_hits >= fdrtool_hits) #choose which method detects more hits
+  {limma_results$hit_annotation_method[limma_results$comparison == comparison] <- "limma"}
+  if (fdrtool_hits > limma_hits)
+  { limma_results$hit_annotation_method[limma_results$comparison == comparison] <- "fdrtool"}
+  rm(limma_hits, fdrtool_hits)
+}
+rm(comparison)
+table(limma_results$hit_annotation_method)
+
+# limma_results$hit_annotation_method <- "limma"
+limma_results$hit_annotation_method[!grepl("[(,)]", limma_results$comparison)] <- "limma"
+
+limma_results$pvalue[limma_results$hit_annotation_method == "limma"] <- 
+  limma_results$pvalue.limma[limma_results$hit_annotation_method == "limma"]
+limma_results$fdr[limma_results$hit_annotation_method == "limma"] <- 
+  limma_results$fdr.limma[limma_results$hit_annotation_method == "limma"]
+
+limma_results$pvalue[limma_results$hit_annotation_method == "fdrtool"] <- 
+  limma_results$pvalue.fdrtool[limma_results$hit_annotation_method == "fdrtool"]
+limma_results$fdr[limma_results$hit_annotation_method == "fdrtool"] <- 
+  limma_results$qval.fdrtool[limma_results$hit_annotation_method == "fdrtool"]
+
+limma_results$hit <- #assign hit or no hit based on defined thresholds
+  with(limma_results, ifelse(fdr <= fdr_hit_threshold & abs(logFC) >= 
+                               log2(fc_hit_threshold), TRUE, FALSE))
+limma_results$hit_annotation <- with(limma_results,
+  ifelse(fdr <= fdr_hit_threshold & abs(logFC) >= log2(fc_hit_threshold),
+         "hit",
+         "no hit"))
+limma_results$hit_annotation <- 
+  factor(limma_results$hit_annotation, 
+         ordered = TRUE, 
+         levels = c("hit", "no hit"))
+caption.text_DE = glue("hit: fdr <= {fdr_hit_threshold} & absolute log2(fold-change) >= log2({fc_hit_threshold})")
+customPlot_DE <- append(customPlot_DE, list(labs(caption = caption.text_DE)))
+
+# Keep only enriched hits
+ctrl.comparisons <- c("PT1: intracellular_C - negcontrol_C", "PT1: extracellular_C - negcontrol_C", "PT1: extracellular - negcontrol")
+
+limma_results$hit_annotation <- as.character(limma_results$hit_annotation)
+limma_results$hit_annotation.orig <- limma_results$hit_annotation
+for (comparison in unique(limma_results$comparison))
+{
+  comparison.orig <- comparison
+  s <- gsub(": .+", "", comparison)
+  comparison <- gsub(".+: ", "", comparison)
+  comparison.list_i <- gsub("[(,)]", "",
+                            unlist(base::strsplit(comparison, split = " - ")))
+  comparison.list_i <- comparison.list_i[!comparison.list_i %in% conditions$ctrl[conditions$condition %in% comparison.list_i]]
+  enriched <- NULL
+  for (comparison_i in comparison.list_i)
+  {
+    to_compare <- grep(paste0("^", s, ": ", comparison_i, " -"), ctrl.comparisons, value = TRUE)
+    enriched <- append(enriched, 
+                       as.character(subset(limma_results,
+                                           comparison == to_compare &
+                                             hit_annotation.orig %in%
+                                             c("hit") & logFC > 0)$Gene)) #enriched hits must be "hit" and positive FC
+  }
+  rm(comparison.list_i, comparison_i, to_compare)
+  enriched <- unique(enriched)
+  limma_results$hit_annotation[
+    limma_results$comparison == comparison.orig & limma_results$Gene %in% enriched
+    ] <- 
+    paste("enriched", limma_results$hit_annotation[
+      limma_results$comparison == comparison.orig & limma_results$Gene %in% enriched
+      ])
+}
+rm(comparison, ctrl.comparisons, comparison.orig)
+limma_results$hit_annotation.orig <- NULL
+limma_results$hit_annotation <- factor(limma_results$hit_annotation, 
+                                       ordered = TRUE, 
+                                       levels = c("enriched hit",
+                                                  "hit",
+                                                  "no hit"))
+
+with(limma_results, table(comparison, hit_annotation))
+limma_results$comparison <- limma_results$comparison.old
+limma_results$comparison.old <- NULL
+
+limma_results_backup<-limma_results
+
+unique_hits<-as.data.frame(limma_results)%>% #summary of number of hits
+  filter(hit_annotation=="enriched hit")%>%
+  dplyr::filter(comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C"))%>%
+  dplyr::select(c(Gene, comparison))%>%
+  distinct()
+hits_all_unique <- nrow(unique_hits)
+```
+
+#Hit filtering
+all enriched hits were manually filtered to exclude proteins that are not expressed in neurons or in the brain
+```{r HitFiltering}
+enriched_hits<-limma_results%>%
+  filter(hit_annotation == "enriched hit" &
+          comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C"))
+write.csv(enriched_hits, file.path(dir_save, paste0("enriched_hits_all_", script.version, ".csv")), row.names = FALSE)
+
+filtered_hits <- read.xlsx("C:/Users/laura/OneDrive - Cardiff University/Documents/3 - PhD/Proteomics/Interactome/CTX/Results/V5 LA/analysis_V5/Interactome enriched_hits_V5.xlsx", sheet = 1)%>%
+  dplyr::select(Gene, Protein.ID,Included)%>%
+  dplyr::filter(Included == "no") #select ones to be removed then filter
+
+limma_results <- limma_results %>%
+  filter(!Protein.ID %in% filtered_hits$Protein.ID) #remove any Protein.ID in the removed list
+write.csv(limma_results, file.path(dir_save, paste0("Limma_results_filtered_", script.version, ".csv")), row.names = FALSE)
+```
+
+## Enriched hits heatmap
+```{r EnrichedHeatmap}
+enriched_hits<-as.data.frame(limma_results)%>%
+  filter(hit_annotation=="enriched hit")%>%
+  filter(comparison %in% c("intracellular_C - negcontrol_C", "extracellular_C - negcontrol_C","extracellular - negcontrol"))%>%
+  mutate(comparison = recode(comparison,
+                             "intracellular_C - negcontrol_C" = "WT C-term",
+                             "extracellular_C - negcontrol_C" = "WT N-term",
+                             "extracellular - negcontrol" = "PT N-term"))
+
+#reorder highest pvalue at top
+enriched_hits <- enriched_hits %>%
+  mutate(logp = -log10(pvalue))%>%
+  group_by(Gene) %>%
+  mutate(max_p = max(logp)) %>%
+  ungroup() %>%
+  mutate(Gene = reorder(Gene, max_p, decreasing = TRUE))
+
+p<-ggplot(enriched_hits, aes(x = comparison, y = Gene, fill = logp)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "red", high = "blue", name = "-log10(pvalue)", 
+                      trans = "reverse") +  # 'reverse' makes small p-values red 
+  theme_minimal(base_size = 14) +
+  labs(title = NULL, x = NULL, y = NULL)
+
+ggsave(filename = file.path(dir_save, paste0("Enriched hits heatmap_", script.version, "_", Sys.Date(), ".png")),
+      plot = p, width = 5.5, height = 12, dpi=600)
+
+comparisons <- unique(enriched_hits$comparison)
+
+for (comp in comparisons) {
+  
+  df_sub <- enriched_hits %>% # Subset for this comparison
+    filter(comparison == comp) %>%
+  mutate(logp = -log10(pvalue))%>%
+  group_by(Gene) %>%
+  mutate(max_p = max(logp)) %>%
+  ungroup() %>%
+  mutate(Gene = reorder(Gene, max_p, decreasing = TRUE))
+
+p<-ggplot(df_sub, aes(x = comparison, y = Gene, fill = logp)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "red", high = "blue", name = "-log10(pvalue)", 
+                      trans = "reverse") +  # 'reverse' makes small p-values red 
+  theme_minimal(base_size = 14) +
+  labs(title = NULL, x = NULL, y = NULL)
+
+ggsave(filename = file.path(dir_save, paste0("Enriched hits heatmap_separate_", comp, "_", script.version, "_", Sys.Date(), ".png")),
+      plot = p, width = 4, height = 6, dpi=600)
+}
+```
+
+
+#Subcellular localisation
+Based on primary subcellular location listed by UniProt
+```{r subcell}
+subcellular <- read.xlsx("C:/Users/laura/OneDrive - Cardiff University/Documents/3 - PhD/Proteomics/Interactome/CTX/Results/V5 LA/analysis_V5/Interactome enriched_hits_V5.xlsx", sheet = 1)%>%
+  dplyr::filter(Included != "no")%>%
+  dplyr::select(Protein.ID, Subcellular1)
+
+enriched_hits<-as.data.frame(limma_results)%>%
+  filter(hit_annotation=="enriched hit")%>% #only plot enriched hits
+  dplyr::filter(comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C"))%>%
+  dplyr::select(c(Gene, comparison, Protein.ID))%>%
+  distinct()%>%
+  left_join(subcellular, by = c("Protein.ID")) #annotated localisation from spreadsheet
+
+subcellular_percent <- enriched_hits %>%
+  group_by(comparison, Subcellular1) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(comparison) %>%
+  mutate(
+    Percent = (Count / sum(Count)) * 100,
+    comparison = recode(
+    comparison,
+    "extracellular - negcontrol" = "PT N-term",
+    "intracellular_C - negcontrol_C" = "WT C-term",
+    "extracellular_C - negcontrol_C" = "WT N-term"
+  )) %>%
+  ungroup()
+
+#stacked bar plot
+p<-ggplot(subcellular_percent, aes(x = comparison, y = Percent, fill = Subcellular1)) +
+  geom_bar(stat = "identity", position = "stack") +  
+  labs(x = "Comparison",
+      y = "Percentage",
+      fill = "Subcellular Location",
+      title = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(),
+    plot.title = element_text(face = "bold", hjust = 0.5))+
+    scale_fill_tableau(name = "Subcellular \nLocation") 
+
+ggsave(filename = file.path(dir_save, paste0("Subcellular barplot_", script.version, "_", Sys.Date(), ".png")),
+       plot = p, width = 5, height = 5, dpi=600)
+```
+
+## Volcano-plot
+```{r LimmaVolcanoPlot, fig.height = 7}
+samples <- unique(limma_results$sample)
+customPlot_DE2 <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = c(16, 17, 15, 3, 7, 8)), 
+  scale_colour_manual(values = c("enriched hit" = "#33a02c", "hit" = "#1f78b4", "no hit" = "#555555")),
+  scale_alpha_manual(values = c("enriched hit" = 1,  "hit" = 1, "no hit" = 0.1)))
+
+for (s in samples) {
+  dat_sample <- subset(limma_results, sample == s) %>%
+    mutate(plot_group = comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C")  )
+
+  for (set_type in c(TRUE, FALSE)) {
+    dat_sub <- dat_sample %>%
+      filter(plot_group == set_type)
+    if (nrow(dat_sub) == 0) next  # skip if no data
+    
+    volcano_labels <- dat_sub %>%
+      group_by(sample, comparison.label) %>%
+      summarise( #annotations for number of proteins 
+        up_hits = sum(hit_annotation == "enriched hit" & logFC > 0),
+        down_hits = sum(hit_annotation == "hit" & logFC < 0),
+        total_points = n(),
+        .groups = "drop")
+    
+    p <- ggplot(dat_sub, aes(logFC, -log10(pvalue), colour = hit_annotation, alpha = hit_annotation)) +
+      geom_vline(xintercept = 0) +
+      geom_point() +
+      geom_text(aes(label = gsub("[|].+", "", Gene)), colour = "black", show.legend = FALSE,
+        data = subset(dat_sub, hit_annotation != "no hit"), vjust = 0, nudge_y = 0.1,
+        size = 2, check_overlap = TRUE) +
+      facet_wrap(~comparison.label) +
+      xlab("log2(fold-change)") +
+      customPlot_DE2 +
+      theme_classic() +
+      theme(strip.background = element_blank(),) +
+      geom_text(data = volcano_labels,
+        aes(x = Inf, y = Inf,
+          label = paste0(
+          "Enriched hits: ", up_hits, "\n",
+          "Downregulated hits: ", down_hits, "\n",
+          "Total proteins: ", total_points)),
+        hjust = 1, vjust = 1,inherit.aes = FALSE, size = 2.5, colour = "black") +
+      coord_cartesian(clip = "off")+
+      labs(colour = "Hit annotation", alpha = "Hit annotation") 
+    
+    ggsave(filename = file.path(dir_save,  paste0("Volcano_plot_", ifelse(set_type, "WT", "PT"), "_",script.version, "_", Sys.Date(), ".png")),plot = p, width = 13, height = 7)}}
+```
+
+## Half Volcano-plot
+```{r HalfVolcanoPlot}
+samples <- unique(limma_results$sample)
+customPlot_DE2 <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = c(16, 17, 15, 3, 7, 8)), 
+  scale_colour_manual(values = c("enriched hit" = "#1f78b4", "hit" = "#1f78b4", "no hit" = "#555555")),
+  scale_alpha_manual(values = c("enriched hit" = 1,  "hit" = 1, "no hit" = 0.1))
+)
+
+for (s in samples) {
+  dat_sample <- subset(limma_results, sample == s)%>%
+  mutate(comparison.label = recode(comparison.label,
+                             "intracellular_C vs negcontrol_C" = "WT C-term",
+                             "extracellular_C vs negcontrol_C" = "WT N-term",
+                             "extracellular vs negcontrol" = "PT N-term"))%>%
+  mutate(comparison = recode(comparison,
+                             "intracellular_C - negcontrol_C" = "WT C-term",
+                             "extracellular_C - negcontrol_C" = "WT N-term",
+                             "extracellular - negcontrol" = "PT N-term"))
+  
+  dat_sample <- dat_sample %>%
+    mutate(plot_group = comparison %in% c("WT C-term", "WT N-term", "PT N-term"))
+  
+  for (set_type in c(TRUE, FALSE)) {
+    
+    dat_sub <- dat_sample %>%
+      filter(plot_group == set_type)%>%
+      filter(hit_annotation %in% c("enriched hit", "no hit"))%>%
+      filter(logFC >0)
+    
+    if (nrow(dat_sub) == 0) next  # skip if no data
+    
+    p <- ggplot(dat_sub, aes(logFC, -log10(pvalue), colour = hit_annotation, alpha = hit_annotation)) +
+      geom_point() +
+      geom_text(aes(label = gsub("[|].+", "", Gene)),
+        colour = "black", show.legend = FALSE, data = subset(dat_sub, hit_annotation != "no hit"), 
+        vjust = 0, nudge_y = 0.1, size = 2, check_overlap = TRUE) +
+      facet_wrap(~comparison.label, ncol = 1) +
+      xlab("log2(fold-change)") +
+      customPlot_DE2 +
+      theme_classic() +
+      theme(strip.background = element_blank(),)+
+      coord_cartesian(clip = "off") + 
+      scale_x_continuous(expand = c(0, 0)) +  
+      labs(colour = "Hit annotation", alpha = "Hit annotation") 
+    
+    ggsave(filename = file.path(dir_save, paste0("Half Volcano_plot_",ifelse(set_type, "WT", "PT"), "_",
+          script.version, "_", Sys.Date(), ".png")), plot = p, width = 5, height = 8)}}
+```
+
+#Save limma results
+
+```{r LimmaSave}
+write.csv(limma_results, file.path(dir_save, paste0("Limma_results_", script.version, ".csv")), row.names = FALSE)
+```
+
+# GO term enrichment analysis
+## Preparation
+```{r GO_IDLUT}
+calculateFE <- function(GeneRatio, BgRatio) #calculate fold enrichment for each protein and background
+{
+  GeneRatio <- as.numeric(unlist(str_split(GeneRatio, pattern = "/"))) 
+  BgRatio <- as.numeric(unlist(str_split(BgRatio, pattern = "/"))) #background
+  odds_ratio <- (GeneRatio[1] / GeneRatio[2]) / (BgRatio[1] / BgRatio[2]) #calculate odds ratio
+  return(odds_ratio)
+}
+ID_LUT <- bitr(geneID = cdata$Gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+names(ID_LUT) <- c("Gene", "ENTREZID")
+```
+
+## GO analysis: Enriched hits only
+```{r GO_DE}
+limma_results <- left_join(limma_results, ID_LUT)
+ego_data <- limma_results %>%
+  dplyr::filter(!is.na(ENTREZID), hit_annotation %in% c("enriched hit")) %>%
+  dplyr::select(ENTREZID, sample, comparison, logFC) %>%
+  distinct() %>% 
+  mutate(comparison = gsub("[.]", "_", comparison)) %>%
+  mutate(grouping = paste(sample, comparison, sep = "___")) %>%
+  mutate(direction = ifelse(logFC > 0, "upregulated", "downregulated")) %>%
+  dplyr::select(ENTREZID, grouping, direction)
+```
+
+### Cellular compartment
+```{r GO_DE_CC}
+ego_results_DE_CC <- NULL
+try(ego_results_DE_CC <- compareCluster(ENTREZID ~ grouping + direction,
+                                    data = ego_data, fun = "enrichGO",
+                                    OrgDb = org.Hs.eg.db,
+                                    keyType = "ENTREZID",
+                                    ont = "CC",
+                                    readable = TRUE))
+if (!is.null(ego_results_DE_CC))
+{
+  ego_results_DE_CC_table <- ego_results_DE_CC@compareClusterResult
+  ego_results_DE_CC_table <- ego_results_DE_CC_table %>% 
+    mutate(comparison = gsub(".+___", "", grouping), sample = gsub("___.+", "", grouping)) %>%
+    group_by(ID, sample, comparison, direction) %>%
+    mutate(odds_ratio = calculateFE(GeneRatio, BgRatio))%>% #calculate odds ratio
+    filter(comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C"))
+  ego_results_DE_CC_table$Description <- factor(ego_results_DE_CC_table$Description, levels = unique(rev(ego_results_DE_CC_table$Description)))
+  write.csv(ego_results_DE_CC_table, file.path(dir_save, paste0("GO_enrichment_DE_CC_limma_results_", script.version, ".csv")), row.names = FALSE)
+  ego_sub <- ego_results_DE_CC_table %>% 
+    group_by(sample, comparison, direction) %>%
+    slice_head(n = 5)%>% #plot top 5 GO terms per sample
+    ungroup()
+  
+p <- ggplot(data = ego_sub, aes(x = comparison, y = Description)) +
+  geom_point(aes(size = odds_ratio, colour = -log10(p.adjust))) +
+  theme_bw()+
+  theme(plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA), 
+    strip.background = element_rect(fill = "white", colour = NA))+
+  scale_colour_gradientn(colours = c("#377eb8", "#984ea3", "#e41a1c", "#ff7f00", "#ffff33")) +
+  ggtitle(paste("Cellular compartment")) +
+  ylab("") +
+  xlab("") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  guides(size   = guide_legend(order = 1),
+    colour = guide_colourbar(order = 2))
+        
+  ggsave(file.path(dir_save, paste0("GO_enrichment_DE_CC_dotplot_", script.version, "_", Sys.Date(), ".png")), p,  width = 6,  height = 8)
+}
+```
+
+### Molecular function
+```{r GO_DE_MF}
+ego_results_DE_MF <- NULL
+try(ego_results_DE_MF <- compareCluster(ENTREZID ~ grouping + direction,
+                                    data = ego_data, fun = "enrichGO",
+                                    OrgDb = org.Hs.eg.db,
+                                    keyType = "ENTREZID",
+                                    ont = "MF",
+                                    readable = TRUE))
+if (!is.null(ego_results_DE_MF)) {
+  
+  ego_results_DE_MF_table <- ego_results_DE_MF@compareClusterResult %>% 
+    mutate(
+      comparison = gsub(".+___", "", grouping),
+      sample = gsub("___.+", "", grouping)
+    ) %>%
+    group_by(ID, sample, comparison, direction) %>%
+    mutate(odds_ratio = calculateFE(GeneRatio, BgRatio)) %>%
+    filter(comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C")) %>%
+    ungroup()
+  
+  ego_results_DE_MF_table$Description <- factor(
+    ego_results_DE_MF_table$Description,
+    levels = unique(rev(ego_results_DE_MF_table$Description)))
+  
+ 
+  write.csv(ego_results_DE_MF_table, file.path(dir_save, paste0("GO_enrichment_DE_MF_limma_results_", script.version, ".csv")),
+    row.names = FALSE)
+
+  ego_sub <- ego_results_DE_MF_table %>%
+    group_by(sample, comparison, direction) %>%
+    slice_head(n = 5) %>% #top 5 per group
+    ungroup() %>%
+    mutate(
+  plot_group = ifelse(
+    grepl("^extracellular_C\\s*-\\s*negcontrol_C$", comparison, ignore.case = TRUE) |
+    grepl("^intracellular_C\\s*-\\s*negcontrol_C$", comparison, ignore.case = TRUE),
+    TRUE, FALSE))
+  
+    ego_sub <- ego_sub %>%
+  group_by(sample, plot_group, comparison, direction) %>%
+  arrange(desc(odds_ratio), .by_group = TRUE) %>%
+  mutate(Description_reordered = factor(Description, levels = unique(Description))) %>%
+  ungroup()
+      
+      ego_sub$direction <- factor(ego_sub$direction, levels = c("upregulated", "downregulated"))
+      
+      if (nrow(ego_sub) > 0) {
+        
+        p <- ggplot(data = ego_sub, aes(comparison, Description_reordered)) +
+          geom_point(aes(size = odds_ratio, colour = -log10(p.adjust))) +
+          theme_bw() +
+          scale_colour_gradientn(
+            colours = c("#377eb8", "#984ea3", "#e41a1c", "#ff7f00", "#ffff33")
+          ) +
+          ggtitle("Molecular function") +
+          ylab("") +
+          xlab("") +
+          theme(
+            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+            plot.background = element_rect(fill = "white", colour = NA),
+            panel.background = element_rect(fill = "white", colour = NA),
+            strip.background = element_rect(fill = "white", colour = NA)
+          ) +
+    guides(size   = guide_legend(order = 1),
+    colour = guide_colourbar(order = 2))
+        
+    ggsave(file.path(dir_save, paste0("GO_enrichment_DE_MF_dotplot_", script.version, "_", Sys.Date(), ".png")),plot = p, width = 7,
+    height = 6)
+  }
+}
+```
+
+### Biological process
+```{r GO_DE_BP}
+ego_results_DE_BP <- NULL
+try(ego_results_DE_BP <- compareCluster(ENTREZID ~ grouping + direction,
+                                    data = ego_data, fun = "enrichGO",
+                                    OrgDb = org.Hs.eg.db,
+                                    keyType = "ENTREZID",
+                                    ont = "BP",
+                                    readable = TRUE))
+                                    #universe = ID_LUT$ENTREZID))
+if (!is.null(ego_results_DE_BP)) {
+  
+  ego_results_DE_BP_table <- ego_results_DE_BP@compareClusterResult %>%
+    mutate(
+      comparison = gsub(".+___", "", grouping),
+      sample = gsub("___.+", "", grouping)
+    ) %>%
+    group_by(ID, sample, comparison, direction) %>%
+    mutate(odds_ratio = calculateFE(GeneRatio, BgRatio)) %>%
+    filter(sample=="PT1")%>%
+    filter(comparison %in% c("extracellular - negcontrol", "extracellular_C - negcontrol_C", "intracellular_C - negcontrol_C"))%>%
+    ungroup()
+  
+
+  ego_results_DE_BP_table$Description <- factor(
+    ego_results_DE_BP_table$Description,
+    levels = unique(rev(ego_results_DE_BP_table$Description)))
+  
+  write.csv(ego_results_DE_BP_table, file.path(dir_save, paste0("GO_enrichment_DE_BP_limma_results_", script.version, ".csv")),
+    row.names = FALSE )
+  
+  ego_sub <- ego_results_DE_BP_table %>%
+    group_by(sample, comparison, direction) %>%
+    slice_head(n = 5) %>%
+    ungroup() %>%
+    mutate(
+  plot_group = ifelse(
+    grepl("^extracellular_C\\s*-\\s*negcontrol_C$", comparison, ignore.case = TRUE) |
+    grepl("^intracellular_C\\s*-\\s*negcontrol_C$", comparison, ignore.case = TRUE),
+    TRUE, FALSE))
+  
+  ego_sub <- ego_sub %>%
+  group_by(sample, plot_group, comparison, direction) %>%
+  arrange(desc(odds_ratio), .by_group = TRUE) %>%
+  mutate(Description_reordered = factor(Description, levels = unique(Description))) %>%
+  ungroup()
+  
+      if (nrow(ego_sub) > 0) {
+        p <- ggplot(data = ego_sub, aes(x = comparison, y = Description)) +
+          geom_point(aes(size = odds_ratio, colour = -log10(p.adjust))) +
+          theme_bw(base_size = 12) +
+          scale_colour_gradientn(colours = c("#377eb8", "#984ea3", "#e41a1c", "#ff7f00", "#ffff33")) +
+          ggtitle("Biological process") +
+          ylab("") +
+          xlab("") +
+          theme(
+            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+            plot.background = element_rect(fill = "white", colour = NA),
+            panel.background = element_rect(fill = "white", colour = NA),
+            strip.background = element_rect(fill = "white", colour = NA)
+          ) +
+          guides(size   = guide_legend(order = 1), colour = guide_colourbar(order = 2))
+        
+        ggsave(file.path(dir_save, paste0("GO_enrichment_DE_BP_dotplot_", script.version,"_",Sys.Date(), ".png")), plot = p, width = 7, height = 6)
+  }
+}
+```
+
+# Save Methods for analysis
+```{r SaveMethods}
+method.description <- "For the proteomics data analysis the raw output files of FragPipe (protein.tsv files files) were processed using the R programming environment (ISBN 3-900051-07-0)."
+method.description <- append(method.description, "Initial data processing included filtering out contaminants and reverse proteins. Only proteins quantified with at least 2 razor peptides (with Razor.Peptides >= 2) were considered for further analysis.")
+method.description <- append(method.description, paste(nrow(cdata), "proteins passed the quality control filters."))
+method.description <- append(method.description, glue("In order to correct for technical variability, batch effects were removed using the 'removeBatchEffect' function of the limma package (PMID: 25605792) on the log2 transformed raw TMT reporter ion intensities ('channel' columns). Subsequently, normalization was performed using the 'normalizeVSN' function of the limma package (VSN - variance stabilization normalization - PMID: 12169536)."))
+if (length(unique(conditions$norm_group)) > 1) 
+{
+  method.description <- append(method.description, paste("Normalization was performed separately for the following groups:", paste(unique(conditions$norm_group), collapse = " and "), ". This ensured that abundance differences across these groups were preserved."))
+}
+method.description <- append(method.description, "Differential expression analysis was performed using the moderated t-test provided by the limma package (PMID: 25605792). The model accounted for replicate information by including it as a factor in the design matrix passed to the 'lmFit' function.")
+if ("fdrtool" %in% limma_results$hit_annotation_method)
+{
+  method.description <- append(method.description, "To obtain p-values and false discovery rates (FDRs), the 'fdrtool' function from the fdrtool package (PMID: 18441000) was used to analyze the t-values produced by limma for certain comparisons.")
+}
+method.description <- append(method.description, glue("Proteins were annotated as hits if they had a false discovery rate (FDR) below {fdr_hit_threshold} and an absolute fold change greater than {fc_hit_threshold}."))
+method.description <- append(method.description, "Gene ontology (GO) enrichment analysis was performed using the 'compareCluster' function of the 'clusterProfiler' package (PMID: 22455463), which assesses over-representation of GO terms in the dataset relative to the background gene set. Enrichment was conducted for the following GO categories: Cellular Component (CC), Molecular Function (MF), and Biological Process (BP). The analysis was performed using 'org.Hs.eg.db' as the reference database. The odds ratio ('odds_ratio') for each GO term was calculated by comparing the proportion of genes associated with that term in the dataset ('GeneRatio') to the proportion in the background set ('BgRatio'). An odds ratio greater than 1 indicates that the GO term is enriched in the dataset compared to the expected background.")
+method.description <- paste(method.description, collapse = " ")
+writeLines(text = method.description, con = file.path(dir_save, paste0("Methods_", script.version, ".txt")))
+```
